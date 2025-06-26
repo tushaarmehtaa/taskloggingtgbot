@@ -39,6 +39,19 @@ class SimpleClarificationHandler:
     def needs_clarification(self, text: str) -> bool:
         """Check if text contains vague time references that need clarification."""
         text_lower = text.lower()
+
+        # Patterns that indicate a specific time has been mentioned.
+        # If found, no clarification is needed, and the AI parser should handle it.
+        specific_time_patterns = [
+            r'\d{1,2}:\d{2}\s*(am|pm)?',  # e.g., 5:30, 5:30pm, 17:30
+            r'\b\d{1,2}\s*(pm|am)\b',      # e.g., 5pm, 5 am
+            r'(at|for|by)\s+\d{1,2}(\s*pm|\s*am)?\b' # e.g., at 5, for 5pm, by 3
+        ]
+
+        if any(re.search(pattern, text_lower) for pattern in specific_time_patterns):
+            return False
+
+        # If no specific time is found, then check for vague terms.
         return any(re.search(pattern, text_lower) for pattern in self.VAGUE_TIME_PATTERNS)
     
     def extract_task_action_and_object(self, text: str) -> Tuple[str, str]:

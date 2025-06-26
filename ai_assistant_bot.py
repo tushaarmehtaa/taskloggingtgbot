@@ -1,8 +1,13 @@
 import os
 import logging
 import hashlib
+import os
+import random
+import speech_recognition as sr
 from datetime import datetime, timedelta
 from typing import List
+from dateutil import parser as date_parser
+from pydub import AudioSegment
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler, ConversationHandler
@@ -32,10 +37,20 @@ class AIAssistantBot:
         self.clarification_handler = SimpleClarificationHandler()
         self.scheduler = AsyncIOScheduler()
         self.application = None
-        
+        self.main_user_id = None  # Store user ID for proactive messages
+
+        # Wellness suggestions
+        self.wellness_suggestions = [
+            "💧 Remember to drink some water!",
+            "🚶‍♀️ Time for a short walk to stretch your legs.",
+            "🧘 Take a moment to breathe deeply.",
+            "👀 Look away from the screen for 20 seconds to rest your eyes.",
+            "💪 A quick stretch can do wonders!"
+        ]
+
         # Create database tables
         create_tables()
-        
+
         # Set up logging
         logging.basicConfig(
             format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -47,7 +62,7 @@ class AIAssistantBot:
         """Initialize components that need the event loop to be running."""
         self.scheduler.start()
         self.logger.info("Scheduler started.")
-        
+
         # Schedule wellness task cleanup every 30 minutes
         self.scheduler.add_job(
             self.cleanup_expired_wellness_tasks,
@@ -56,8 +71,19 @@ class AIAssistantBot:
             id='wellness_cleanup'
         )
 
+        # Schedule proactive wellness messages every 4 hours
+        self.scheduler.add_job(
+            self.send_proactive_wellness_suggestion,
+            'interval',
+            hours=1,
+            id='proactive_wellness'
+        )
+
     async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle the /start command."""
+        self.main_user_id = update.effective_user.id
+        self.logger.info(f"User {self.main_user_id} started the bot. Storing user ID for proactive messages.")
+
         welcome_message = (
             "🤖 *AI Task Assistant*\n\n"
             "I can help you manage tasks using natural language!\n\n"
@@ -71,62 +97,118 @@ class AIAssistantBot:
         await update.message.reply_text(welcome_message, parse_mode='Markdown')
 
     async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle user messages with simplified clarification logic and robust task processing."""
-        user_id = update.effective_user.id
-        user_message = update.message.text
-        self.logger.info(f"[Message] User {user_id}: '{user_message}'")
+        """Handle user text messages by passing them to the processing function."""
+        await self._process_text(update, context, update.message.text)
 
-        if self.clarification_handler.needs_clarification(user_message):
-            await self._ask_for_time_clarification(update, user_message)
-            return
+    async def _process_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE, text_to_process: str):
+        """A shared function to process text from both text and voice messages."""
+        user_id = update.effective_user.id
+        self.logger.info(f"[Processing] User {user_id}: '{text_to_process}'")
 
         thinking_message = await update.message.reply_text("🧠 Thinking...")
         db = next(get_db())
         try:
             all_user_tasks = db.query(Task).filter(Task.user_id == user_id).all()
-            result = await self.ai_parser.manage_tasks(user_message, all_user_tasks)
+            result = await self.ai_parser.manage_tasks(text_to_process, all_user_tasks)
 
+            # Handle conversational intents first
+            if result.get('intent') in ['general_query', 'greeting']:
+                response = result.get('response', "Hello! How can I help?")
+                await thinking_message.edit_text(response, parse_mode='Markdown')
+                return
+
+            # If AI parser returned empty results and text has vague time patterns, try clarification
+            if not result and self.clarification_handler.needs_clarification(text_to_process):
+                await thinking_message.delete()
+                await self._ask_for_time_clarification(update, text_to_process)
+                return
+
+            action_taken = False
             if result.get('completions'):
-                completed_titles = []
-                for comp in result['completions']:
-                    task_id = comp.get('id')
+                action_taken = True
+                completed_tasks = []
+                for completion in result['completions']:
+                    task_id = completion['id']
                     task = db.query(Task).filter(Task.id == task_id, Task.user_id == user_id).first()
-                    if task and task.status == 'pending':
+                    if task:
                         task.status = 'completed'
-                        completed_titles.append(task.title)
-                    elif task:
-                        await thinking_message.edit_text(f"✅ Task '{task.title}' was already completed.")
-                        await self.show_tasks(update, context)
-                        return
-                if completed_titles:
+                        completed_tasks.append(f"✅ {task.title}")
+                        self.logger.info(f"Completed task: {task.title}")
+
+                if completed_tasks:
                     db.commit()
-                    await thinking_message.delete()
-                    await self.show_tasks(update, context, completed_tasks=completed_titles)
+                    await self.show_tasks(update, context, completed_tasks)
                     return
 
             if result.get('creations'):
-                created_tasks = []
-                for task_data in result['creations']:
-                    task = Task(user_id=user_id, **task_data)
-                    db.add(task)
-                    db.flush()
-                    await self._schedule_reminder(task)
-                    created_tasks.append(task.title)
+                action_taken = True
+                for creation in result['creations']:
+                    try:
+                        # Parse the date string into a datetime object
+                        due_date = None
+                        reminder_at = None
+                        if creation.get('due_date'):
+                            due_date = date_parser.parse(creation['due_date'])
+                        if creation.get('reminder_at'):
+                            reminder_at = date_parser.parse(creation['reminder_at'])
+
+                        new_task = Task(
+                            user_id=user_id,
+                            title=creation['title'],
+                            due_date=due_date,
+                            reminder_at=reminder_at,
+                            priority=creation.get('priority', 'medium'),
+                            status='pending'
+                        )
+                        db.add(new_task)
+                        db.flush()  # Get the ID
+                        
+                        # Schedule reminder if needed
+                        if new_task.reminder_at:
+                            self._schedule_reminder(new_task)
+                        
+                        self.logger.info(f"Created task: {new_task.title} (ID: {new_task.id})")
+                    except Exception as e:
+                        self.logger.error(f"Error creating task: {e}")
+                        continue
+
                 db.commit()
-                await thinking_message.delete()
                 await self.show_tasks(update, context)
                 return
 
-            if result.get('query') == 'list_tasks':
-                await thinking_message.delete()
+            if result.get('updates'):
+                action_taken = True
+                for update_item in result['updates']:
+                    task_id = update_item['id']
+                    fields = update_item['fields_to_update']
+                    task = db.query(Task).filter(Task.id == task_id, Task.user_id == user_id).first()
+                    if task:
+                        for field, value in fields.items():
+                            if hasattr(task, field):
+                                if field in ['due_date', 'reminder_at'] and value:
+                                    try:
+                                        setattr(task, field, date_parser.parse(value))
+                                    except:
+                                        self.logger.error(f"Failed to parse date: {value}")
+                                        continue
+                                else:
+                                    setattr(task, field, value)
+                        self.logger.info(f"Updated task: {task.title}")
+
+                db.commit()
                 await self.show_tasks(update, context)
                 return
 
-            await thinking_message.edit_text("I'm not sure how to help. Try creating a task or asking for your '/tasks'.")
+            # If no actions were taken, show current tasks or provide help
+            if not action_taken:
+                if not result:
+                    await thinking_message.edit_text("I'm not sure how to help. Try creating a task or asking for your 'tasks'.")
+                else:
+                    await self.show_tasks(update, context)
 
         except Exception as e:
-            self.logger.error(f"Error in handle_message: {e}", exc_info=True)
-            await thinking_message.edit_text("Sorry, an error occurred.")
+            self.logger.error(f"Error in _process_text: {e}", exc_info=True)
+            await thinking_message.edit_text("Sorry, I encountered an error processing your request.")
         finally:
             db.close()
 
@@ -134,33 +216,34 @@ class AIAssistantBot:
         """Ask for time clarification using inline buttons."""
         action, object_part = self.clarification_handler.extract_task_action_and_object(original_message)
         task_preview = self.clarification_handler.create_task_title(action, object_part)
-        
+
+        # Use a truncated hash to stay within Telegram's 64-byte callback_data limit
+        message_hash = hashlib.sha256(original_message.encode()).hexdigest()[:16]
+
         # Create inline keyboard with time options
         keyboard = []
         time_slots = self.clarification_handler.TIME_SLOTS
-        
+
         # Create rows of 4 buttons each
         for i in range(0, len(time_slots), 4):
             row = []
             for j in range(4):
                 if i + j < len(time_slots):
                     display_time, actual_time = time_slots[i + j]
-                    callback_data = f"time_{actual_time}_{hashlib.sha256(original_message.encode()).hexdigest()}"
+                    callback_data = f"time_{actual_time}_{message_hash}"
                     row.append(InlineKeyboardButton(display_time, callback_data=callback_data))
             keyboard.append(row)
-        
+
         # Add custom time option
-        keyboard.append([InlineKeyboardButton("📝 Custom Time", callback_data=f"custom_{hashlib.sha256(original_message.encode()).hexdigest()}")])
-        
+        keyboard.append([InlineKeyboardButton("📝 Custom Time", callback_data=f"custom_{message_hash}")])
+
         reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        message_hash = hashlib.sha256(original_message.encode()).hexdigest()
-        
+
         # Store the original message in a class variable for callback access
         if not hasattr(self, 'pending_clarifications'):
             self.pending_clarifications = {}
         self.pending_clarifications[message_hash] = original_message
-        
+
         question = f"What time would you like to *{task_preview.lower()}*?"
         await update.message.reply_text(
             question,
@@ -233,6 +316,50 @@ class AIAssistantBot:
             )
              # Note: This would require additional conversation handling for custom times
             # For now, we'll keep it simple with predefined slots
+
+    async def handle_voice_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle voice messages by transcribing them and processing the text."""
+        self.logger.info("Received voice message.")
+        processing_message = await update.message.reply_text("🎤 Processing voice note...")
+
+        try:
+            voice_file = await context.bot.get_file(update.message.voice.file_id)
+            
+            temp_dir = "temp_audio"
+            if not os.path.exists(temp_dir):
+                os.makedirs(temp_dir)
+
+            oga_path = os.path.join(temp_dir, f"{update.message.voice.file_id}.oga")
+            wav_path = os.path.join(temp_dir, f"{update.message.voice.file_id}.wav")
+
+            await voice_file.download_to_drive(oga_path)
+
+            audio = AudioSegment.from_ogg(oga_path)
+            audio.export(wav_path, format="wav")
+
+            recognizer = sr.Recognizer()
+            with sr.AudioFile(wav_path) as source:
+                audio_data = recognizer.record(source)
+            
+            transcribed_text = recognizer.recognize_google(audio_data)
+            self.logger.info(f"Transcription: '{transcribed_text}'")
+
+            os.remove(oga_path)
+            os.remove(wav_path)
+
+            # Delete the 'processing' message and call the shared text processor
+            await processing_message.delete()
+            await self._process_text(update, context, transcribed_text)
+
+        except sr.UnknownValueError:
+            self.logger.warning("Google Speech Recognition could not understand audio")
+            await processing_message.edit_text("Sorry, I couldn't understand what you said. Please try again.")
+        except sr.RequestError as e:
+            self.logger.error(f"Could not request results from Google Speech Recognition service; {e}")
+            await processing_message.edit_text("Sorry, my speech recognition service is down.")
+        except Exception as e:
+            self.logger.error(f"Error processing voice message: {e}", exc_info=True)
+            await processing_message.edit_text("An unexpected error occurred while processing your voice note.")
 
     async def show_tasks(self, update: Update, context: ContextTypes.DEFAULT_TYPE, completed_tasks: List[str] = None):
         """Show user's tasks in a formatted list. Can also show a completion message."""
@@ -315,8 +442,6 @@ class AIAssistantBot:
         finally:
             db.close()
 
-
-
     async def cleanup_expired_wellness_tasks(self):
         """Auto-complete expired wellness tasks (breaks, water, exercise, etc.)."""
         db = next(get_db())
@@ -324,20 +449,26 @@ class AIAssistantBot:
             now = datetime.now()
             wellness_keywords = ['break', 'water', 'exercise', 'walk', 'stretch', 'rest', 'breathe', 'drink', 'hydrate']
             
-            # Find expired wellness tasks - more specific criteria
+            # Find expired wellness tasks - be more aggressive with break tasks
             expired_wellness_tasks = db.query(Task).filter(
                 Task.status == 'pending',
-                Task.due_date < now - timedelta(minutes=15),  # Give 15 min grace period
-                Task.priority == 'low'  # Wellness tasks typically have low priority
+                Task.due_date < now  # Any overdue task
             ).all()
             
             completed_count = 0
             # Filter by wellness keywords in title
             for task in expired_wellness_tasks:
                 if any(keyword in task.title.lower() for keyword in wellness_keywords):
-                    task.status = 'completed'
-                    completed_count += 1
-                    self.logger.info(f"Auto-completed expired wellness task: {task.title}")
+                    # For break tasks, auto-complete immediately when overdue
+                    if 'break' in task.title.lower():
+                        task.status = 'completed'
+                        completed_count += 1
+                        self.logger.info(f"Auto-completed expired break task: {task.title}")
+                    # For other wellness tasks, give 15 min grace period and check priority
+                    elif task.due_date < now - timedelta(minutes=15) and task.priority == 'low':
+                        task.status = 'completed'
+                        completed_count += 1
+                        self.logger.info(f"Auto-completed expired wellness task: {task.title}")
             
             if completed_count > 0:
                 db.commit()
@@ -347,6 +478,18 @@ class AIAssistantBot:
             self.logger.error(f"Error in wellness task cleanup: {e}")
         finally:
             db.close()
+
+    async def send_proactive_wellness_suggestion(self):
+        """Periodically send a random wellness suggestion to the user."""
+        if self.main_user_id:
+            try:
+                suggestion = random.choice(self.wellness_suggestions)
+                await self.application.bot.send_message(chat_id=self.main_user_id, text=suggestion)
+                self.logger.info(f"Sent proactive wellness suggestion to user {self.main_user_id}: {suggestion}")
+            except Exception as e:
+                self.logger.error(f"Failed to send proactive wellness suggestion: {e}", exc_info=True)
+        else:
+            self.logger.info("Skipping proactive wellness suggestion: user ID not set yet.")
 
     def run(self):
         """Set up and run the bot."""
@@ -360,8 +503,9 @@ class AIAssistantBot:
         # Add handlers
         self.application.add_handler(CommandHandler("start", self.start_command))
         self.application.add_handler(CommandHandler("tasks", self.show_tasks))
-        self.application.add_handler(CallbackQueryHandler(self.handle_time_selection))
         self.application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_message))
+        self.application.add_handler(MessageHandler(filters.VOICE, self.handle_voice_message))
+        self.application.add_handler(CallbackQueryHandler(self.handle_time_selection))
 
         self.logger.info("🤖 AI Assistant Bot is starting...")
         self.application.run_polling()

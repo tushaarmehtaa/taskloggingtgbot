@@ -35,62 +35,55 @@ class AITaskParser:
         task_mapping = {str(i): task.id for i, task in enumerate(pending_tasks, 1)}
         task_mapping_str = "\n".join([f"Display #{i} = Task ID {task.id}" for i, task in enumerate(pending_tasks, 1)]) or "No task mappings."
         
-        tomorrow = (datetime.now() + timedelta(days=1)).strftime('%Y-%m-%d')
+        now = datetime.now()
+        current_time_str = now.strftime('%Y-%m-%d %H:%M:%S')
+        tomorrow = (now + timedelta(days=1)).strftime('%Y-%m-%d')
 
         system_prompt = f"""
-        You are a task management AI. Analyze the user's message and return JSON with the appropriate actions.
+        You are a friendly, intelligent, and time-aware AI assistant for managing a to-do list. Your primary goal is to understand the user's request, correct any errors, and respond with a single, valid JSON object that represents the necessary actions.
 
-        Current date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
-        User's pending tasks:
+        **CRITICAL CONTEXT**:
+        - **Current Time**: `{current_time_str}`. All relative times (e.g., "in 5 minutes", "tonight", "in 30 seconds") MUST be calculated based on this exact time. Do not guess.
+
+        **Core Capabilities**:
+        1.  **Smart Correction**: The user's message may be a raw transcription from a voice note and contain phonetic or spelling errors. You must intelligently correct these mistakes before processing the command.
+        2.  **Time-Aware Task Management**: You can create, complete, update, and list tasks. All dates and times must be calculated relative to the current time provided above.
+        3.  **Conversational Handling**: You can handle simple greetings and general questions.
+
+        **User's Current Tasks**:
         {numbered_tasks_str}
 
-        IMPORTANT - Task Number to ID Mapping:
+        **Task ID Mapping (for updates/completions)**:
         {task_mapping_str}
 
-        **RULES:**
-        1. For task completion by number (e.g., "done 1", "complete 2", "finished 3"), use the TASK ID from the mapping above, NOT the display number.
-        2. For task completion by description (e.g., "completed the presentation"), match against task titles.
-        3. For task creation, extract title, due_date, priority, and reminder_at.
-        4. For task queries, set query to "list_tasks".
-        5. Assume "today" for times without explicit dates (e.g., "10am" = "today 10:00:00").
-        6. Set priority based on urgency:
-           - "urgent": Critical deadlines, emergencies, time-sensitive tasks
-           - "high": Important tasks with near deadlines, work priorities
-           - "medium": Regular tasks, moderate importance (default)
-           - "low": Wellness tasks (breaks, water, exercise), optional tasks
+        **JSON Response Structure**:
+        Respond with a JSON object containing one or more of the following fields:
+        - `creations`: A list of new tasks to be created. Each task must have a `title`, `due_date` (in '%Y-%m-%d %H:%M:%S' format), `reminder_at` (same as due_date), and `priority`.
+        - `completions`: A list of tasks to be marked as complete. Each must have the `id` of the task.
+        - `updates`: A list of tasks to be updated. Each must have the `id` of the task and a `fields_to_update` dictionary.
+        - `general_query`: For questions like "help" or "what can you do?". Respond with a well-formatted, user-friendly guide using Telegram's `Markdown` format. CRITICAL: Use single asterisks for bold (e.g., *bold text*), not double asterisks.
+        - `greeting`: For simple greetings like "hey", "hello", "hi". Provide a friendly `response`.
 
-        **Examples:**
-        - "done 1" → Look up Task ID for display #1 from mapping → {{"completions": [{{"id": ACTUAL_TASK_ID}}]}}
-        - "complete task 3" → Look up Task ID for display #3 from mapping → {{"completions": [{{"id": ACTUAL_TASK_ID}}]}}
-        - "finished the presentation" → {{"completions": [{{"id": matching_task_id}}]}}
-        - "pay rent by tomorrow 5pm" → {{"creations": [{{"title": "Pay rent", "due_date": "tomorrow 17:00:00", "priority": "high"}}]}}
-        - "take a break in 30 minutes" → {{"creations": [{{"title": "Take a break", "due_date": "today +30min", "priority": "low"}}]}}
+        **Examples**:
+        - User: "remind me to call mom at 3pm tomorrow"
+          JSON: {{"creations": [{{"title": "Call mom", "due_date": "{tomorrow} 15:00:00", "reminder_at": "{tomorrow} 15:00:00", "priority": "medium"}}]}}
+        - User: "remind me to take a break in 30 seconds" (Current time is {current_time_str})
+          JSON: {{"creations": [{{"title": "Take a break", "due_date": "{(now + timedelta(seconds=30)).strftime('%Y-%m-%d %H:%M:%S')}", "reminder_at": "{(now + timedelta(seconds=30)).strftime('%Y-%m-%d %H:%M:%S')}", "priority": "medium"}}]}}
+        - User: "Go play jirutsu at 8pm" -> (You correct this to "Go play jujutsu at 8pm")
+          JSON: {{"creations": [{{"title": "Go play jujutsu", "due_date": "{now.strftime('%Y-%m-%d')} 20:00:00", "reminder_at": "{now.strftime('%Y-%m-%d')} 20:00:00", "priority": "medium"}}]}}
+        - User: "done 2"
+          JSON: {{"completions": [{{"id": {task_mapping.get('2')}}}]}}
+        - User: "all tasks are done for today" or "mark all tasks complete" or "everything is done"
+          JSON: {{"completions": [{{"id": task_id}} for task_id in [{', '.join([str(task.id) for task in user_context if task.status == 'pending'])}]]}}
+        - User: "what can you do?"
+          JSON: {{"intent": "general_query", "response": "I'm your AI assistant for managing your to-do list! Here's what I can help you with:\n\n*Task Management:*\n- Create new tasks with reminders (e.g., 'remind me to call mom at 3pm tomorrow')\n- Mark tasks as complete (e.g., 'done 2' to complete task #2)\n- Update existing tasks\n- Show your current task list\n\n*Smart Features:*\n- I understand relative time (like 'in 5 minutes', 'tonight', 'tomorrow')\n- I can correct spelling and voice transcription errors\n\n*How to Use:*\n- Just tell me what you want to do naturally\n- Say 'show my tasks' to see everything\n- Use 'done [number]' to complete tasks"}}
+        - User: "hey"
+          JSON: {{"intent": "greeting", "response": "Hello! How can I help you today?"}}
 
-        **JSON Structure:**
-        {{
-          "query": null,
-          "creations": [
-            {{
-              "title": "Task title",
-              "due_date": "YYYY-MM-DD HH:MM:SS",
-              "reminder_at": "YYYY-MM-DD HH:MM:SS", 
-              "priority": "medium"
-            }}
-          ],
-          "completions": [
-            {{"id": task_id}}
-          ],
-          "deletions": [
-            {{"id": task_id}}
-          ]
-        }}
-
-        User message: "{text}"
-
-        Return only valid JSON. CRITICAL: Use the correct Task ID from the mapping, not the display number.
+        If the user's request is unclear or doesn't fit any of the above actions, return an empty JSON object: {{}}.
         """
         message = await self.anthropic_client.messages.create(
-            model="claude-3-5-sonnet-20240620",
+            model="claude-sonnet-4-20250514",
             max_tokens=2000,
             temperature=0.1,
             system=system_prompt,
@@ -101,44 +94,25 @@ class AITaskParser:
         content = message.content[0].text.strip()
         logger.debug(f"Raw AI response for task management:\n{content}")
         
-        task_actions = {
-            "query": None,
-            "creations": [],
-            "completions": [],
-            "deletions": []
-        }
-
         try:
-            json_match = re.search(r"```json\s*(\{.*?\})\s*```", content, re.DOTALL)
-            json_str = ""
+            # Find the JSON block, whether it's in a markdown code block or not
+            json_match = re.search(r'\{.*\}', content, re.DOTALL)
             if json_match:
-                json_str = json_match.group(1)
-            else:
-                json_match = re.search(r'\{.*\}', content, re.DOTALL)
-                if json_match:
-                    json_str = json_match.group(0)
-
-            if json_str:
+                json_str = json_match.group(0)
                 parsed_json = json.loads(json_str)
-                task_actions["query"] = parsed_json.get("query")
                 
-                creations = parsed_json.get("creations", [])
-                if creations:
-                    task_actions["creations"] = self._validate_and_process_tasks(creations)
+                # Directly return the parsed JSON. The bot logic can handle the structure.
+                return parsed_json
+            else:
+                logger.warning(f"No JSON object found in AI response: {content}")
+                return {}
 
-                completions = parsed_json.get("completions", [])
-                if completions:
-                    task_actions["completions"] = completions
-
-                deletions = parsed_json.get("deletions", [])
-                if deletions:
-                    task_actions["deletions"] = deletions
-
-        except (json.JSONDecodeError, KeyError) as e:
-            logger.error(f"Error parsing AI response for task management: {e}\nContent: {content}", exc_info=True)
-            return { "query": None, "creations": [], "completions": [], "deletions": [] }
-            
-        return task_actions
+        except json.JSONDecodeError:
+            logger.error(f"Failed to decode JSON from AI response: {content}")
+            return {}
+        except Exception as e:
+            logger.error(f"An unexpected error occurred during task parsing: {e}")
+            return {}
     
     def _validate_and_process_tasks(self, tasks_data: List[Dict]) -> List[Dict]:
         """
@@ -252,7 +226,7 @@ class AITaskParser:
             user_prompt = user_message
 
         message = await self.anthropic_client.messages.create(
-            model="claude-3-5-sonnet-20240620",
+            model="claude-sonnet-4-20250514",
             max_tokens=100,
             temperature=0.2,
             system=system_prompt,
