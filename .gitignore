@@ -1,0 +1,15 @@
+# Environment variables
+.env
+
+# Database file
+ai_assistant.db
+
+# Python bytecode
+__pycache__/
+*.pyc
+
+# IDE and editor files
+.idea/
+.vscode/
+*.sublime-workspace
+*.sublime-project
