@@ -5,8 +5,15 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 # Enable logging
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 
-# Replace 'YOUR_BOT_TOKEN' with the token you got from BotFather
-TOKEN = '8053388194:AAHHdbkNUzfhUF6dQn6NapcsRgtoXbBjr6I'
+import os
+from dotenv import load_dotenv
+
+# Load environment variables
+dotenv_path = os.path.join(os.path.dirname(__file__), '.env')
+if os.path.exists(dotenv_path):
+    load_dotenv(dotenv_path=dotenv_path)
+
+TOKEN = os.getenv('TELEGRAM_BOT_TOKEN_MY_BOT')
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Send a message when the command /start is issued."""
