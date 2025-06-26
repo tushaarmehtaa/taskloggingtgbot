@@ -1,5 +1,7 @@
 # Environment variables
 .env
+.env.local
+.env.production
 
 # Database file
 ai_assistant.db
@@ -7,9 +9,37 @@ ai_assistant.db
 # Python bytecode
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
+
+# Temporary files
+temp_audio/
+*.tmp
+*.temp
+
+# Log files
+*.log
+logs/
 
 # IDE and editor files
 .idea/
 .vscode/
 *.sublime-workspace
 *.sublime-project
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Security sensitive files
+*.key
+*.pem
+*.p12
+*.pfx
+config.json
+secrets.json

@@ -1,44 +1,65 @@
 import os
 import logging
-import hashlib
-import os
+import asyncio
 import random
-import speech_recognition as sr
 from datetime import datetime, timedelta
-from typing import List
+from typing import List, Dict
+from collections import defaultdict, deque
 from dateutil import parser as date_parser
-from pydub import AudioSegment
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler, ConversationHandler
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.date import DateTrigger
+import speech_recognition as sr
+from pydub import AudioSegment
 from dotenv import load_dotenv
+import hashlib
 
 from database import get_db, Task, create_tables
 from ai_parser import AITaskParser
 from clarification_utils import SimpleClarificationHandler
 
 # Load environment variables
-dotenv_path = os.path.join(os.path.dirname(__file__), '.env')
-if os.path.exists(dotenv_path):
-    load_dotenv(dotenv_path=dotenv_path)
+load_dotenv()
 
 # Configure logging
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
-logger = logging.getLogger(__name__)
 
 class AIAssistantBot:
     def __init__(self):
+        self.token = os.getenv('TELEGRAM_BOT_TOKEN')
+        if not self.token:
+            raise ValueError("TELEGRAM_BOT_TOKEN environment variable is required")
+        
+        self.application = Application.builder().token(self.token).post_init(self.post_init).build()
         self.ai_parser = AITaskParser()
         self.clarification_handler = SimpleClarificationHandler()
         self.scheduler = AsyncIOScheduler()
-        self.application = None
-        self.main_user_id = None  # Store user ID for proactive messages
-
+        self.logger = logging.getLogger(__name__)
+        
+        # Security: Rate limiting (requests per minute per user)
+        self.rate_limit_window = 60  # seconds
+        self.max_requests_per_window = 30  # requests per minute
+        self.user_requests = defaultdict(deque)
+        
+        # Security: Input validation limits
+        self.max_message_length = 2000
+        self.max_voice_duration = 120  # seconds
+        
+        # Security: User authorization (optional - set ALLOWED_USERS in .env)
+        allowed_users_str = os.getenv('ALLOWED_USERS', '')
+        self.allowed_users = set()
+        if allowed_users_str:
+            try:
+                self.allowed_users = set(int(uid.strip()) for uid in allowed_users_str.split(',') if uid.strip())
+                self.logger.info(f"User authorization enabled for {len(self.allowed_users)} users")
+            except ValueError:
+                self.logger.warning("Invalid ALLOWED_USERS format. Authorization disabled.")
+        
         # Wellness suggestions
         self.wellness_suggestions = [
             "💧 Remember to drink some water!",
@@ -47,42 +68,71 @@ class AIAssistantBot:
             "👀 Look away from the screen for 20 seconds to rest your eyes.",
             "💪 A quick stretch can do wonders!"
         ]
-
+        
+        self.user_chat_id = None  # For wellness suggestions
+        
         # Create database tables
         create_tables()
+        
+        self._setup_handlers()
 
-        # Set up logging
-        logging.basicConfig(
-            format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-            level=logging.INFO
-        )
-        self.logger = logging.getLogger(__name__)
+    def _is_rate_limited(self, user_id: int) -> bool:
+        """Check if user has exceeded rate limit."""
+        now = datetime.now()
+        user_queue = self.user_requests[user_id]
+        
+        # Remove old requests outside the window
+        while user_queue and (now - user_queue[0]).total_seconds() > self.rate_limit_window:
+            user_queue.popleft()
+        
+        # Check if user has exceeded limit
+        if len(user_queue) >= self.max_requests_per_window:
+            return True
+        
+        # Add current request
+        user_queue.append(now)
+        return False
+
+    def _is_authorized(self, user_id: int) -> bool:
+        """Check if user is authorized (if authorization is enabled)."""
+        if not self.allowed_users:  # No authorization configured
+            return True
+        return user_id in self.allowed_users
+
+    def _validate_input(self, text: str) -> tuple[bool, str]:
+        """Validate user input for security and length."""
+        if not text or not text.strip():
+            return False, "Empty message received."
+        
+        if len(text) > self.max_message_length:
+            return False, f"Message too long. Please keep it under {self.max_message_length} characters."
+        
+        # Basic content validation (prevent potential injection attempts)
+        suspicious_patterns = ['<script', 'javascript:', 'data:', 'vbscript:']
+        text_lower = text.lower()
+        if any(pattern in text_lower for pattern in suspicious_patterns):
+            return False, "Message contains suspicious content."
+        
+        return True, ""
 
     async def post_init(self, application):
         """Initialize components that need the event loop to be running."""
         self.scheduler.start()
         self.logger.info("Scheduler started.")
 
-        # Schedule wellness task cleanup every 30 minutes
-        self.scheduler.add_job(
-            self.cleanup_expired_wellness_tasks,
-            'interval',
-            minutes=30,
-            id='wellness_cleanup'
-        )
-
-        # Schedule proactive wellness messages every 4 hours
-        self.scheduler.add_job(
-            self.send_proactive_wellness_suggestion,
-            'interval',
-            hours=1,
-            id='proactive_wellness'
-        )
-
     async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle the /start command."""
-        self.main_user_id = update.effective_user.id
-        self.logger.info(f"User {self.main_user_id} started the bot. Storing user ID for proactive messages.")
+        user_id = update.effective_user.id
+        if not self._is_authorized(user_id):
+            await update.message.reply_text("You are not authorized to use this bot.")
+            return
+        
+        if self._is_rate_limited(user_id):
+            await update.message.reply_text("You have exceeded the rate limit. Please try again later.")
+            return
+        
+        self.user_chat_id = user_id
+        self.logger.info(f"User {user_id} started the bot. Storing user ID for proactive messages.")
 
         welcome_message = (
             "🤖 *AI Task Assistant*\n\n"
@@ -98,7 +148,22 @@ class AIAssistantBot:
 
     async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle user text messages by passing them to the processing function."""
-        await self._process_text(update, context, update.message.text)
+        user_id = update.effective_user.id
+        if not self._is_authorized(user_id):
+            await update.message.reply_text("You are not authorized to use this bot.")
+            return
+        
+        if self._is_rate_limited(user_id):
+            await update.message.reply_text("You have exceeded the rate limit. Please try again later.")
+            return
+        
+        text = update.message.text
+        is_valid, error_message = self._validate_input(text)
+        if not is_valid:
+            await update.message.reply_text(error_message)
+            return
+        
+        await self._process_text(update, context, text)
 
     async def _process_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE, text_to_process: str):
         """A shared function to process text from both text and voice messages."""
@@ -214,6 +279,15 @@ class AIAssistantBot:
 
     async def _ask_for_time_clarification(self, update: Update, original_message: str):
         """Ask for time clarification using inline buttons."""
+        user_id = update.effective_user.id
+        if not self._is_authorized(user_id):
+            await update.message.reply_text("You are not authorized to use this bot.")
+            return
+        
+        if self._is_rate_limited(user_id):
+            await update.message.reply_text("You have exceeded the rate limit. Please try again later.")
+            return
+        
         action, object_part = self.clarification_handler.extract_task_action_and_object(original_message)
         task_preview = self.clarification_handler.create_task_title(action, object_part)
 
@@ -253,6 +327,15 @@ class AIAssistantBot:
 
     async def handle_time_selection(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle time selection from inline buttons."""
+        user_id = update.effective_user.id
+        if not self._is_authorized(user_id):
+            await update.message.reply_text("You are not authorized to use this bot.")
+            return
+        
+        if self._is_rate_limited(user_id):
+            await update.message.reply_text("You have exceeded the rate limit. Please try again later.")
+            return
+        
         query = update.callback_query
         await query.answer()
         
@@ -319,6 +402,15 @@ class AIAssistantBot:
 
     async def handle_voice_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle voice messages by transcribing them and processing the text."""
+        user_id = update.effective_user.id
+        if not self._is_authorized(user_id):
+            await update.message.reply_text("You are not authorized to use this bot.")
+            return
+        
+        if self._is_rate_limited(user_id):
+            await update.message.reply_text("You have exceeded the rate limit. Please try again later.")
+            return
+        
         self.logger.info("Received voice message.")
         processing_message = await update.message.reply_text("🎤 Processing voice note...")
 
@@ -329,8 +421,10 @@ class AIAssistantBot:
             if not os.path.exists(temp_dir):
                 os.makedirs(temp_dir)
 
-            oga_path = os.path.join(temp_dir, f"{update.message.voice.file_id}.oga")
-            wav_path = os.path.join(temp_dir, f"{update.message.voice.file_id}.wav")
+            # Sanitize file ID to prevent path traversal attacks
+            safe_file_id = os.path.basename(update.message.voice.file_id).replace('..', '')
+            oga_path = os.path.join(temp_dir, f"{safe_file_id}.oga")
+            wav_path = os.path.join(temp_dir, f"{safe_file_id}.wav")
 
             await voice_file.download_to_drive(oga_path)
 
@@ -343,9 +437,6 @@ class AIAssistantBot:
             
             transcribed_text = recognizer.recognize_google(audio_data)
             self.logger.info(f"Transcription: '{transcribed_text}'")
-
-            os.remove(oga_path)
-            os.remove(wav_path)
 
             # Delete the 'processing' message and call the shared text processor
             await processing_message.delete()
@@ -360,10 +451,26 @@ class AIAssistantBot:
         except Exception as e:
             self.logger.error(f"Error processing voice message: {e}", exc_info=True)
             await processing_message.edit_text("An unexpected error occurred while processing your voice note.")
+        finally:
+            # Ensure cleanup happens even if exceptions occur
+            for file_path in [oga_path, wav_path]:
+                try:
+                    if 'file_path' in locals() and os.path.exists(file_path):
+                        os.remove(file_path)
+                except Exception as cleanup_error:
+                    self.logger.warning(f"Failed to cleanup file {file_path}: {cleanup_error}")
 
     async def show_tasks(self, update: Update, context: ContextTypes.DEFAULT_TYPE, completed_tasks: List[str] = None):
         """Show user's tasks in a formatted list. Can also show a completion message."""
         user_id = update.effective_user.id
+        if not self._is_authorized(user_id):
+            await update.message.reply_text("You are not authorized to use this bot.")
+            return
+        
+        if self._is_rate_limited(user_id):
+            await update.message.reply_text("You have exceeded the rate limit. Please try again later.")
+            return
+        
         db = next(get_db())
         try:
             # Centralized sorting logic
@@ -481,32 +588,40 @@ class AIAssistantBot:
 
     async def send_proactive_wellness_suggestion(self):
         """Periodically send a random wellness suggestion to the user."""
-        if self.main_user_id:
+        if self.user_chat_id:
             try:
                 suggestion = random.choice(self.wellness_suggestions)
-                await self.application.bot.send_message(chat_id=self.main_user_id, text=suggestion)
-                self.logger.info(f"Sent proactive wellness suggestion to user {self.main_user_id}: {suggestion}")
+                await self.application.bot.send_message(chat_id=self.user_chat_id, text=suggestion)
+                self.logger.info(f"Sent proactive wellness suggestion to user {self.user_chat_id}: {suggestion}")
             except Exception as e:
                 self.logger.error(f"Failed to send proactive wellness suggestion: {e}", exc_info=True)
         else:
             self.logger.info("Skipping proactive wellness suggestion: user ID not set yet.")
 
-    def run(self):
-        """Set up and run the bot."""
-        token = os.getenv('TELEGRAM_BOT_TOKEN')
-        if not token:
-            self.logger.critical("❌ TELEGRAM_BOT_TOKEN not found!")
-            raise ValueError("TELEGRAM_BOT_TOKEN is required.")
-
-        self.application = Application.builder().token(token).post_init(self.post_init).build()
-        
-        # Add handlers
+    def _setup_handlers(self):
         self.application.add_handler(CommandHandler("start", self.start_command))
         self.application.add_handler(CommandHandler("tasks", self.show_tasks))
         self.application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_message))
         self.application.add_handler(MessageHandler(filters.VOICE, self.handle_voice_message))
         self.application.add_handler(CallbackQueryHandler(self.handle_time_selection))
 
+    def _setup_scheduler(self):
+        self.scheduler.add_job(
+            self.cleanup_expired_wellness_tasks,
+            'interval',
+            minutes=30,
+            id='wellness_cleanup'
+        )
+
+        self.scheduler.add_job(
+            self.send_proactive_wellness_suggestion,
+            'interval',
+            hours=1,
+            id='proactive_wellness'
+        )
+
+    def run(self):
+        """Set up and run the bot."""
         self.logger.info("🤖 AI Assistant Bot is starting...")
         self.application.run_polling()
 
